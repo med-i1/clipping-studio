@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Viral Clips</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237dd3a8'/%3E%3Ctext x='16' y='21' font-family='Arial,sans-serif' font-size='12' font-weight='700' text-anchor='middle' fill='%2308170f'%3EVC%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">VC</span>
+    <span class="brand-copy">
+      <strong>Viral Clips</strong>
+      <small>Local clipping studio</small>
+    </span>
+  </div>
+  <div class="topbar-actions">
+    <span id="server-status" class="pill pill-muted">Connecting…</span>
+    <button id="token-btn" class="btn btn-ghost" type="button" hidden>API token</button>
+  </div>
+</header>
+
+<div class="app" id="app">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <button id="new-job-btn" class="btn btn-primary" type="button">+ New job</button>
+      <button id="refresh-btn" class="btn btn-ghost btn-icon" type="button" title="Refresh jobs" aria-label="Refresh jobs">↻</button>
+    </div>
+    <label class="field compact" for="filter">
+      <span>Filter</span>
+      <select id="filter">
+        <option value="all">All jobs</option>
+        <option value="active">Active</option>
+        <option value="completed">Completed</option>
+        <option value="failed">Failed</option>
+      </select>
+    </label>
+    <div id="job-list" class="job-list" aria-live="polite"></div>
+  </aside>
+
+  <main class="main" id="view">
+    <section id="form-view" class="view">
+      <header class="page-head">
+        <p class="eyebrow">New job</p>
+        <h1>Turn a long video into short clips</h1>
+        <p class="muted">Paste a URL. The pipeline downloads, transcribes, ranks and cuts the strongest moments.</p>
+      </header>
+
+      <form id="job-form" class="card form" novalidate>
+        <label class="field wide" for="url">
+          <span>Video URL</span>
+          <input id="url" type="url" required autocomplete="off" placeholder="https://www.youtube.com/watch?v=..." spellcheck="false">
+        </label>
+
+        <div class="grid-4">
+          <label class="field" for="clips">
+            <span>Clips</span>
+            <input id="clips" type="number" min="1" max="10" step="1" value="5" inputmode="numeric">
+          </label>
+          <label class="field" for="min-duration">
+            <span>Min seconds</span>
+            <input id="min-duration" type="number" min="5" max="600" step="1" value="20" inputmode="numeric">
+          </label>
+          <label class="field" for="max-duration">
+            <span>Max seconds</span>
+            <input id="max-duration" type="number" min="5" max="600" step="1" value="90" inputmode="numeric">
+          </label>
+          <label class="field" for="quality">
+            <span>Video quality</span>
+            <select id="quality">
+              <option value="best">Best available</option>
+              <option value="2160p">4K · 2160p</option>
+              <option value="1440p">1440p</option>
+              <option value="1080p">1080p</option>
+              <option value="720p">720p</option>
+              <option value="480p">480p</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="grid-3">
+          <label class="field" for="language">
+            <span>Language</span>
+            <select id="language">
+              <option value="auto">Auto detect</option>
+              <option value="ar">Arabic</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <label class="field" for="subtitles">
+            <span>Subtitles</span>
+            <select id="subtitles">
+              <option value="true">Generate</option>
+              <option value="false">Skip</option>
+            </select>
+          </label>
+          <label class="field" for="keep-original">
+            <span>Original file</span>
+            <select id="keep-original">
+              <option value="true">Keep</option>
+              <option value="false">Discard</option>
+            </select>
+          </label>
+        </div>
+
+        <fieldset class="field platforms">
+          <legend>Platforms</legend>
+          <label class="check"><input id="platform-tiktok" type="checkbox" checked> TikTok</label>
+          <label class="check"><input id="platform-instagram-reels" type="checkbox" checked> Instagram Reels</label>
+          <label class="check"><input id="platform-youtube-shorts" type="checkbox" checked> YouTube Shorts</label>
+        </fieldset>
+
+        <details class="advanced">
+          <summary>Advanced</summary>
+          <label class="field wide" for="format">
+            <span>yt-dlp format selector (optional, overrides quality)</span>
+            <input id="format" type="text" autocomplete="off" placeholder="bv*+ba/b" spellcheck="false">
+          </label>
+        </details>
+
+        <p id="form-error" class="error" role="alert" hidden></p>
+
+        <div class="form-actions">
+          <button id="submit-btn" class="btn btn-primary" type="submit">Create job</button>
+          <span class="hint">Jobs run on this machine. Long videos can take a while.</span>
+        </div>
+      </form>
+    </section>
+
+    <section id="job-view" class="view" hidden>
+      <header class="job-head card">
+        <div class="job-head-main">
+          <p id="job-source" class="eyebrow">Job</p>
+          <h1 id="job-title">Job</h1>
+          <p id="job-meta" class="muted"></p>
+        </div>
+        <div class="job-head-side">
+          <span id="job-status" class="pill">queued</span>
+          <div id="job-actions" class="actions"></div>
+        </div>
+      </header>
+
+      <div class="card progress-card">
+        <div class="progress-row">
+          <span id="job-step">Queued</span>
+          <span id="job-progress-label">0%</span>
+        </div>
+        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <i id="job-progress"></i>
+        </div>
+      </div>
+
+      <div class="tabs" role="tablist" aria-label="Job views" id="tabs">
+        <button class="tab is-active" id="tab-clips" role="tab" aria-selected="true" aria-controls="panel-clips" type="button">Clips</button>
+        <button class="tab" id="tab-logs" role="tab" aria-selected="false" aria-controls="panel-logs" type="button">Logs</button>
+        <button class="tab" id="tab-report" role="tab" aria-selected="false" aria-controls="panel-report" type="button">Report</button>
+      </div>
+
+      <section id="panel-clips" class="panel" role="tabpanel" aria-labelledby="tab-clips"></section>
+      <section id="panel-logs" class="panel" role="tabpanel" aria-labelledby="tab-logs" hidden></section>
+      <section id="panel-report" class="panel" role="tabpanel" aria-labelledby="tab-report" hidden></section>
+    </section>
+  </main>
+</div>
+
+<dialog id="delete-dialog" class="dialog">
+  <form method="dialog">
+    <h2>Delete job?</h2>
+    <p id="delete-message" class="muted"></p>
+    <div class="dialog-actions">
+      <button class="btn btn-ghost" type="submit" value="cancel">Cancel</button>
+      <button class="btn btn-danger" type="submit" value="confirm">Delete job</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="token-dialog" class="dialog">
+  <form id="token-form" method="dialog">
+    <h2>API token required</h2>
+    <p class="muted">This server is protected. Paste the token configured in <code>VIRAL_API_TOKEN</code>.</p>
+    <label class="field" for="token-input">
+      <span>Token</span>
+      <input id="token-input" type="password" autocomplete="off">
+    </label>
+    <p id="token-error" class="error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button class="btn btn-primary" type="submit">Unlock</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<noscript><p class="noscript">This interface needs JavaScript enabled.</p></noscript>
+<script src="/app.js"></script>
+</body>
+</html>

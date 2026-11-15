@@ -1,0 +1,9 @@
+[project]
+name = "clipping-studio"
+version = "1.0.0"
+description = "YouTube Clipping Studio"
+requires-python = ">=3.11"
+
+[project.scripts]
+clipping-studio = "cli:main"
+viral-clips = "clipper.viral.cli:main"

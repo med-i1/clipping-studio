@@ -1,0 +1,16 @@
+{
+  "format": "bv*+ba/b",
+  "retry": 3,
+  "force_keyframes": false,
+  "skip_existing": true,
+  "output_mode": "fast",
+  "ffmpeg_preset": "veryfast",
+  "ffmpeg_crf": 20,
+  "resume": true,
+  "parallel_workers": 4,
+  "min_file_size_kb": 50,
+  "download_full_video": true,
+  "keep_full_video": false,
+  "download_mode": "clip",
+  "language": "ar"
+}
