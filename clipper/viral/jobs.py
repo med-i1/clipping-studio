@@ -34,6 +34,47 @@ ACTIVE_STATUSES = {
 TERMINAL_STATUSES = {"completed", "failed"}
 
 
+def _pid_alive(pid: Optional[int]) -> bool:
+    """Return True if a process with this PID is running.
+
+    Never sends a signal on Windows: ``os.kill(pid, 0)`` there terminates
+    the process instead of probing it.
+    """
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        process_query_limited_information = 0x1000
+        still_active = 259
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            # Access denied means the process exists but belongs to someone else.
+            return ctypes.get_last_error() == 5
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 class JobManager:
     """A small in-process worker plus JSON job records on disk.
 
@@ -51,6 +92,7 @@ class JobManager:
         self._lock = threading.RLock()
         self._records: Dict[str, JobRecord] = {}
         self._futures: Dict[str, Future] = {}
+        self.recover_interrupted_jobs()
 
     # ------------------------------------------------------------------
     # Creation / execution
@@ -79,6 +121,7 @@ class JobManager:
             output_path=str(job_root),
             options=job_options.to_dict(),
             attempts=1,
+            worker_pid=os.getpid(),
         )
         with self._lock:
             self._records[job_id] = record
@@ -102,6 +145,8 @@ class JobManager:
             self._futures[record.job_id] = future
 
     def _execute(self, record: JobRecord, logger: JobLogger) -> None:
+        with self._lock:
+            record.worker_pid = os.getpid()
         try:
             pipeline = build_pipeline(self.config, logger)
             self._change(record, "downloading", 2, "starting")
@@ -230,7 +275,7 @@ class JobManager:
         return records[:max(1, limit)]
 
     def retry_job(self, job_id: str, submit: bool = True) -> JobRecord:
-        record = self.get_job(job_id)
+        record = self._reconcile(self.get_job(job_id))
         if record.status in ACTIVE_STATUSES:
             raise PipelineError(errors.JOB_NOT_RETRYABLE, "This job is still running.")
         if record.status == "completed":
@@ -243,6 +288,7 @@ class JobManager:
             record.current_step = "queued"
             record.error = None
             record.attempts += 1
+            record.worker_pid = os.getpid()
             record.updated_at = utc_now()
             self._records[record.job_id] = record
             self._save(record)
@@ -256,7 +302,7 @@ class JobManager:
         """Remove a finished job record and its output folder."""
         job_id = validate_job_id(job_id)
         with self._lock:
-            record = self.get_job(job_id)
+            record = self._reconcile(self.get_job(job_id))
             future = self._futures.get(job_id)
             if record.status in ACTIVE_STATUSES or (future is not None and not future.done()):
                 raise PipelineError(
@@ -275,6 +321,87 @@ class JobManager:
                     ) from exc
             self._records.pop(job_id, None)
             self._futures.pop(job_id, None)
+
+    def assign_worker(self, job_id: str, pid: int) -> JobRecord:
+        """Record that a detached worker process now owns a queued job."""
+        record = self.get_job(job_id)
+        with self._lock:
+            record.worker_pid = int(pid)
+            record.updated_at = utc_now()
+            self._records[record.job_id] = record
+            self._save(record)
+        return JobRecord.from_dict(record.to_dict())
+
+    # ------------------------------------------------------------------
+    # Crash recovery
+    # ------------------------------------------------------------------
+
+    def _is_orphaned(self, record: JobRecord) -> bool:
+        """An active job whose owning process is gone and will never finish it."""
+        if record.status not in ACTIVE_STATUSES:
+            return False
+        with self._lock:
+            future = self._futures.get(record.job_id)
+            if future is not None and not future.done():
+                return False
+        if record.worker_pid == os.getpid():
+            # Owned by this process (e.g. queued and waiting for a detached
+            # worker to be spawned); not abandoned.
+            return False
+        return not _pid_alive(record.worker_pid)
+
+    def _reconcile(self, record: JobRecord) -> JobRecord:
+        """Mark an orphaned job as failed so it can be retried or deleted."""
+        if not self._is_orphaned(record):
+            return record
+        interrupted_step = record.current_step
+        with self._lock:
+            record.status = "failed"
+            record.current_step = "failed"
+            record.updated_at = utc_now()
+            record.error = PipelineError(
+                errors.JOB_INTERRUPTED,
+                "The job stopped before it finished because the app was closed "
+                "or crashed. Retry it to run it again.",
+                retryable=True,
+            ).to_dict(include_details=False)
+            self._records[record.job_id] = record
+            self._save(record)
+        if record.output_path:
+            JobLogger(record.job_id, Path(record.output_path) / "logs" / "job.jsonl").event(
+                "job_interrupted",
+                level="WARNING",
+                step=interrupted_step,
+                worker_pid=record.worker_pid,
+            )
+        return JobRecord.from_dict(record.to_dict())
+
+    def recover_interrupted_jobs(self) -> List[str]:
+        """Fail every job left active by a process that no longer exists.
+
+        Returns the IDs of the jobs that were recovered.
+        """
+        recovered: List[str] = []
+        if not self.config.output_dir.exists():
+            return recovered
+        for child in self.config.output_dir.iterdir():
+            if not child.is_dir():
+                continue
+            data = read_json(child / "metadata" / "job.json")
+            if not isinstance(data, dict) or not data.get("job_id"):
+                continue
+            try:
+                record = JobRecord.from_dict(data)
+                validate_job_id(record.job_id)
+            except (KeyError, TypeError, ValueError, PipelineError):
+                continue
+            if self._is_orphaned(record):
+                try:
+                    self._reconcile(record)
+                except (OSError, PipelineError):
+                    continue
+                recovered.append(record.job_id)
+        return recovered
 
     def wait(self, job_id: str, timeout: Optional[float] = None) -> JobRecord:
         deadline = time.monotonic() + timeout if timeout else None

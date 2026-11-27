@@ -288,8 +288,10 @@ The existing GUI recovery test remains part of the suite.
 - **The packaged EXE cannot use `--no-wait`.** The detached worker is available
   in the source installation; the desktop app keeps jobs in its own process.
 - **The job queue is in-process and disk-backed.** It is suitable for one
-  desktop user, not a multi-tenant server. Jobs must be retried manually after
-  an app crash.
+  desktop user, not a multi-tenant server. A job whose process died mid-run
+  (app closed or crashed) is marked `failed` with `JOB_INTERRUPTED` the next
+  time the app starts, and can then be retried or deleted. A retry starts the
+  job from the beginning.
 - **Clip extraction is CPU/disk intensive for long videos.** Stream copy is
   used only when the source is already H.264/AAC; VP9, AV1, Opus, and other
   incompatible sources are re-encoded so the MP4 is accepted by social
@@ -308,4 +310,8 @@ The existing GUI recovery test remains part of the suite.
 - URL validation rejects `file://`, localhost, private IP literals, embedded
   credentials, and control characters before a URL reaches yt-dlp.
 - Job IDs and artifact paths are validated to prevent directory traversal.
+- When bound to loopback, the server accepts only loopback `Host` headers
+  (blocks DNS rebinding). POST/DELETE requests from another origin are
+  rejected, and job creation requires `Content-Type: application/json`, so
+  other websites cannot create or delete jobs through your browser.
 - Logs and error payloads redact common API-key/token patterns.

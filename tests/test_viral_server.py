@@ -2,6 +2,7 @@ import contextlib
 import http.client
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -296,6 +297,7 @@ class ServerTests(unittest.TestCase):
         data = json.loads(record_path.read_text(encoding="utf-8"))
         data["status"] = "downloading"
         data["current_step"] = "downloading"
+        data["worker_pid"] = os.getpid()  # owned by a live process
         record_path.write_text(json.dumps(data), encoding="utf-8")
 
         response, payload = self._request(
@@ -306,6 +308,97 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response.status, 409)
         self.assertEqual(json.loads(payload)["error"]["code"], "JOB_NOT_DELETABLE")
         self.assertTrue(record_path.exists())
+
+    # -- request hardening ------------------------------------------------
+
+    def test_suffix_range_returns_the_last_bytes(self):
+        path = f"/files/{self.job_id}/clips/clip_001.mp4"
+        auth = {"Authorization": "Bearer secret-token"}
+        response, payload = self._request("GET", path, headers={**auth, "Range": "bytes=-3"})
+        self.assertEqual(response.status, 206)
+        self.assertEqual(payload, b"789")
+        self.assertEqual(response.getheader("Content-Range"), "bytes 7-9/10")
+
+        response, payload = self._request("GET", path, headers={**auth, "Range": "bytes=-50"})
+        self.assertEqual(response.status, 206)
+        self.assertEqual(payload, b"0123456789")
+
+        response, _ = self._request("GET", path, headers={**auth, "Range": "bytes=-0"})
+        self.assertEqual(response.status, 416)
+
+    def test_rebound_host_name_is_rejected(self):
+        response, payload = self._request(
+            "GET",
+            "/api/jobs",
+            headers={"Host": "evil.example", "Authorization": "Bearer secret-token"},
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(json.loads(payload)["error"]["code"], "FORBIDDEN_HOST")
+
+    def test_localhost_host_name_is_accepted(self):
+        response, _ = self._request(
+            "GET",
+            "/health",
+            headers={"Host": f"localhost:{self.port}", "Authorization": "Bearer secret-token"},
+        )
+        self.assertEqual(response.status, 200)
+
+    def test_cross_origin_post_is_rejected_without_queueing(self):
+        response, payload = self._request(
+            "POST",
+            "/api/jobs",
+            headers={
+                "Authorization": "Bearer secret-token",
+                "Content-Type": "application/json",
+                "Origin": "https://evil.example",
+            },
+            body=json.dumps({"url": "https://www.youtube.com/watch?v=abc"}),
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(json.loads(payload)["error"]["code"], "CROSS_ORIGIN")
+        self.assertEqual(len(self.server.manager.list_jobs()), 1)
+
+    def test_cross_site_fetch_metadata_is_rejected(self):
+        response, _ = self._request(
+            "DELETE",
+            f"/api/jobs/{self.job_id}",
+            headers={"Authorization": "Bearer secret-token", "Sec-Fetch-Site": "cross-site"},
+        )
+        self.assertEqual(response.status, 403)
+        self.assertTrue((self.config.output_dir / self.job_id).exists())
+
+    def test_same_origin_post_is_allowed(self):
+        response, payload = self._request(
+            "POST",
+            "/api/jobs",
+            headers={
+                "Authorization": "Bearer secret-token",
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            body=json.dumps({"url": ""}),
+        )
+        # Passes the origin check and reaches URL validation.
+        self.assertEqual(response.status, 400)
+        self.assertEqual(json.loads(payload)["error"]["code"], "INVALID_URL")
+
+    def test_post_without_json_content_type_is_rejected(self):
+        response, payload = self._request(
+            "POST",
+            "/api/jobs",
+            headers={"Authorization": "Bearer secret-token", "Content-Type": "text/plain"},
+            body=json.dumps({"url": "https://www.youtube.com/watch?v=abc"}),
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual(json.loads(payload)["error"]["code"], "INVALID_OPTIONS")
+        self.assertEqual(len(self.server.manager.list_jobs()), 1)
+
+    def test_wrong_token_is_rejected(self):
+        response, _ = self._request("GET", "/health", headers={"Authorization": "Bearer wrong"})
+        self.assertEqual(response.status, 401)
+        response, _ = self._request("GET", "/health?token=wrong")
+        self.assertEqual(response.status, 401)
 
 
 if __name__ == "__main__":

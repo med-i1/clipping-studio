@@ -360,6 +360,7 @@ never a nested ZIP.
 | `CLIP_EXTRACTION_FAILED` | FFmpeg output invalid. | Usually |
 | `PACKAGING_FAILED` | ZIP write failure. | Yes |
 | `JOB_NOT_FOUND` / `JOB_NOT_RETRYABLE` / `JOB_NOT_DELETABLE` | Bad job ID, invalid transition, or deletion of an active job. | No |
+| `JOB_INTERRUPTED` | The process running the job exited before it finished; set on the next app start. | Yes |
 | `TIMEOUT` | Metadata/download/wait timeout. | Yes |
 | `INTERNAL_ERROR` | Unexpected exception; details are captured in the job log. | Yes |
 

@@ -76,6 +76,7 @@ def cmd_run(args: argparse.Namespace, config: ViralConfig) -> int:
         print("status: queued")
         if args.no_wait:
             worker = spawn_detached_worker(config, record.job_id)
+            manager.assign_worker(record.job_id, worker.pid)
             print(f"worker: started (pid {worker.pid})")
             return 0
         record = _wait_with_progress(manager, record.job_id, args.timeout)
@@ -124,6 +125,7 @@ def cmd_retry(args: argparse.Namespace, config: ViralConfig) -> int:
             _print_record(record, as_json=args.json)
             return 0 if record.status == "completed" else 1
         worker = spawn_detached_worker(config, record.job_id)
+        manager.assign_worker(record.job_id, worker.pid)
         print(f"worker: started (pid {worker.pid})")
         return 0
     finally:
