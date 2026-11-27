@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -8,7 +11,7 @@ from unittest.mock import patch
 from clipper.viral import errors
 from clipper.viral.config import ViralConfig
 from clipper.viral.errors import PipelineError
-from clipper.viral.jobs import JobManager, spawn_detached_worker
+from clipper.viral.jobs import JobManager, _pid_alive, spawn_detached_worker
 from clipper.viral.worker import main as worker_main
 from clipper.viral.models import PipelineResult
 from clipper.viral.packaging import write_json
@@ -277,6 +280,105 @@ class JobManagerTests(unittest.TestCase):
 
         jobs = self.manager.list_jobs()
         self.assertEqual([job.job_id for job in jobs], [newer_id, older_id])
+
+    # -- crash recovery -------------------------------------------------
+
+    def _write_active_record(self, worker_pid=None, status="downloading"):
+        job_id = uuid.uuid4().hex
+        job_root = self.config.output_dir / job_id
+        data = {
+            "job_id": job_id,
+            "source_url": "https://example.com/watch?v=abc123",
+            "status": status,
+            "progress": 12,
+            "current_step": status,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "output_path": str(job_root),
+            "options": {},
+        }
+        if worker_pid is not None:
+            data["worker_pid"] = worker_pid
+        write_json(job_root / "metadata" / "job.json", data)
+        return job_id
+
+    @staticmethod
+    def _dead_pid():
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait(timeout=30)
+        return process.pid
+
+    def test_pid_alive_reports_running_and_exited_processes(self):
+        self.assertTrue(_pid_alive(os.getpid()))
+        self.assertFalse(_pid_alive(self._dead_pid()))
+        self.assertFalse(_pid_alive(None))
+        self.assertFalse(_pid_alive(0))
+
+    def test_job_from_a_dead_process_is_marked_interrupted_on_startup(self):
+        job_id = self._write_active_record(worker_pid=self._dead_pid())
+
+        self.manager = JobManager(self.config)
+        record = self.manager.get_job(job_id)
+
+        self.assertEqual(record.status, "failed")
+        self.assertEqual(record.error["code"], errors.JOB_INTERRUPTED)
+        self.assertTrue(record.error["retryable"])
+        log = (self.config.output_dir / job_id / "logs" / "job.jsonl").read_text(encoding="utf-8")
+        self.assertIn("job_interrupted", log)
+
+    def test_legacy_active_record_without_a_pid_is_recovered(self):
+        job_id = self._write_active_record(worker_pid=None, status="analyzing")
+        self.manager = JobManager(self.config)
+        self.assertEqual(self.manager.get_job(job_id).status, "failed")
+
+    def test_interrupted_job_can_be_retried(self):
+        job_id = self._write_active_record(worker_pid=self._dead_pid())
+        self.manager = JobManager(self.config)
+        with patch("clipper.viral.jobs.build_pipeline", side_effect=self._factory()):
+            retried = self.manager.retry_job(job_id)
+            self.assertEqual(retried.attempts, 2)
+            finished = self.manager.wait(job_id, timeout=10)
+        self.assertEqual(finished.status, "completed")
+
+    def test_interrupted_job_can_be_deleted(self):
+        job_id = self._write_active_record(worker_pid=self._dead_pid())
+        self.manager = JobManager(self.config)
+        self.manager.delete_job(job_id)
+        self.assertFalse((self.config.output_dir / job_id).exists())
+
+    def test_crash_after_startup_is_recovered_on_retry(self):
+        self.manager = JobManager(self.config)
+        job_id = self._write_active_record(worker_pid=self._dead_pid())
+        with patch("clipper.viral.jobs.build_pipeline", side_effect=self._factory()):
+            self.manager.retry_job(job_id)
+            finished = self.manager.wait(job_id, timeout=10)
+        self.assertEqual(finished.status, "completed")
+
+    def test_job_owned_by_a_live_process_is_left_running(self):
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            job_id = self._write_active_record(worker_pid=sleeper.pid)
+            self.manager = JobManager(self.config)
+            self.assertEqual(self.manager.get_job(job_id).status, "downloading")
+            with self.assertRaises(PipelineError) as caught:
+                self.manager.retry_job(job_id)
+            self.assertEqual(caught.exception.code, errors.JOB_NOT_RETRYABLE)
+            with self.assertRaises(PipelineError) as caught:
+                self.manager.delete_job(job_id)
+            self.assertEqual(caught.exception.code, errors.JOB_NOT_DELETABLE)
+        finally:
+            sleeper.kill()
+            sleeper.wait(timeout=30)
+
+    def test_assign_worker_records_the_detached_worker_pid(self):
+        self.manager = JobManager(self.config)
+        record = self.manager.create_job("https://example.com/watch?v=abc123", submit=False)
+        self.assertEqual(record.worker_pid, os.getpid())
+        self.manager.assign_worker(record.job_id, 4321)
+        stored = json.loads(
+            (Path(record.output_path) / "metadata" / "job.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(stored["worker_pid"], 4321)
 
 
 if __name__ == "__main__":

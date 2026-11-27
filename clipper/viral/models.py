@@ -178,6 +178,10 @@ class JobRecord:
     result_path: Optional[str] = None
     package_path: Optional[str] = None
     report_path: Optional[str] = None
+    # PID of the process responsible for running the job. Lets a restarted
+    # app tell a job that is still running elsewhere (a detached worker)
+    # from one whose process died mid-run.
+    worker_pid: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -195,6 +199,7 @@ class JobRecord:
             "result_path": self.result_path,
             "package_path": self.package_path,
             "report_path": self.report_path,
+            "worker_pid": self.worker_pid,
         }
 
     @classmethod
@@ -214,7 +219,15 @@ class JobRecord:
             result_path=data.get("result_path"),
             package_path=data.get("package_path"),
             report_path=data.get("report_path"),
+            worker_pid=_optional_int(data.get("worker_pid")),
         )
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass

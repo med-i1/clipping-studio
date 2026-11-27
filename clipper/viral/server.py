@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import json
 import mimetypes
 import os
@@ -31,6 +33,35 @@ _CSP = (
     "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; "
     "style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'"
 )
+
+
+_LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
+
+
+def _split_host(value: str) -> tuple[str, Optional[int]]:
+    """Split a Host header or URL netloc into (lowercase host, port)."""
+    value = value.strip().lower()
+    if value.startswith("["):
+        host, _, rest = value[1:].partition("]")
+        port_text = rest[1:] if rest.startswith(":") else ""
+    elif value.count(":") == 1:
+        host, _, port_text = value.partition(":")
+    else:
+        host, port_text = value, ""
+    try:
+        port = int(port_text) if port_text else None
+    except ValueError:
+        port = -1
+    return host, port
+
+
+def _is_loopback(host: str) -> bool:
+    if host in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _json_bytes(data: Any) -> bytes:
@@ -76,13 +107,59 @@ class ViralAPIHandler(BaseHTTPRequestHandler):
         print(f"[api] {self.address_string()} {fmt % args}", file=sys.stderr)
 
     def _authorized(self) -> bool:
-        if not self.config.api_token:
+        token = self.config.api_token
+        if not token:
             return True
+        expected = token.encode("utf-8")
         header = self.headers.get("Authorization", "")
-        if header.startswith("Bearer ") and header[7:] == self.config.api_token:
+        if header.startswith("Bearer ") and hmac.compare_digest(header[7:].encode("utf-8"), expected):
             return True
         query = parse_qs(urlparse(self.path).query)
-        return query.get("token", [""])[0] == self.config.api_token
+        supplied = query.get("token", [""])[0].encode("utf-8")
+        return hmac.compare_digest(supplied, expected)
+
+    def _host_allowed(self) -> bool:
+        """Reject DNS-rebinding requests to a loopback-bound server.
+
+        A page on ``evil.example`` that re-points its DNS at 127.0.0.1 still
+        sends ``Host: evil.example``. When the server listens on loopback,
+        only loopback host names are accepted.
+        """
+        bound_host = str(self.server.server_address[0])
+        if not _is_loopback(bound_host):
+            return True  # deliberately exposed; the API token protects it
+        host, _port = _split_host(self.headers.get("Host", ""))
+        return _is_loopback(host)
+
+    def _same_origin(self) -> bool:
+        """Block cross-site requests that change state (CSRF).
+
+        Browsers attach ``Origin`` to cross-origin POST/DELETE requests and
+        ``Sec-Fetch-Site`` to all of them. Non-browser clients (curl, the CLI)
+        send neither and are allowed.
+        """
+        if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        parsed = urlparse(origin)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return False  # includes the opaque "null" origin
+        origin_host, origin_port = _split_host(parsed.netloc)
+        host, port = _split_host(self.headers.get("Host", ""))
+        default = 443 if parsed.scheme == "https" else 80
+        return origin_host == host and (origin_port or default) == (port or default)
+
+    def _guard(self, state_changing: bool) -> bool:
+        """Run the request-level checks; send the error and return False on failure."""
+        if not self._host_allowed():
+            self._send_error_json(HTTPStatus.FORBIDDEN, "FORBIDDEN_HOST", "This host name is not allowed.")
+            return False
+        if state_changing and not self._same_origin():
+            self._send_error_json(HTTPStatus.FORBIDDEN, "CROSS_ORIGIN", "Cross-origin requests are not allowed.")
+            return False
+        return True
 
     def _send(self, status: int, body: bytes, content_type: str, extra: Optional[Dict[str, str]] = None) -> None:
         self.send_response(status)
@@ -120,6 +197,11 @@ class ViralAPIHandler(BaseHTTPRequestHandler):
         )
 
     def _read_json_body(self) -> Dict[str, Any]:
+        # Requiring application/json forces a CORS preflight for any
+        # cross-site sender, which this server never approves.
+        content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise PipelineError(errors.INVALID_OPTIONS, "Content-Type must be application/json.")
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length <= 0 or length > 1_048_576:
             raise PipelineError(errors.INVALID_OPTIONS, "Request body is missing or too large.")
@@ -137,6 +219,8 @@ class ViralAPIHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def do_GET(self) -> None:
+        if not self._guard(state_changing=False):
+            return
         parsed = urlparse(self.path)
         if parsed.path in WEB_ASSETS:
             return self._serve_static(parsed.path)
@@ -249,11 +333,16 @@ class ViralAPIHandler(BaseHTTPRequestHandler):
         range_header = self.headers.get("Range")
         if range_header:
             match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
-            if match:
+            if match and (match.group(1) or match.group(2)):
                 if match.group(1):
                     start = int(match.group(1))
-                if match.group(2):
-                    end = min(size - 1, int(match.group(2)))
+                    if match.group(2):
+                        end = min(size - 1, int(match.group(2)))
+                else:
+                    suffix = int(match.group(2))
+                    start = max(0, size - suffix)
+                    if suffix == 0:
+                        start = size  # zero-length suffix is unsatisfiable
                 if start > end or start >= size:
                     self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
                     self.send_header("Content-Range", f"bytes */{size}")
@@ -293,6 +382,8 @@ class ViralAPIHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def do_POST(self) -> None:
+        if not self._guard(state_changing=True):
+            return
         if not self._authorized():
             self._send_error_json(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "A valid API token is required.")
             return
@@ -321,6 +412,8 @@ class ViralAPIHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def do_DELETE(self) -> None:
+        if not self._guard(state_changing=True):
+            return
         if not self._authorized():
             self._send_error_json(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "A valid API token is required.")
             return
